@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  official-writer:
+    build: .
+    container_name: official-writer-api
+    ports:
+      - "8080:8080"
+    environment:
+      # 阿里云OSS配置 
+      - OSS_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com
+      - OSS_BUCKET_NAME=${OSS_BUCKET_NAME}
+      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID}
+      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET}
+      
+      # API配置
+      - API_TOKEN=official_doc_writer_2024
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8080
+      - DEBUG=false
+      
+      # 文档配置
+      - OSS_DOCUMENT_PREFIX=official_documents/
+    
+    volumes:
+      - ./logs:/app/logs
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  logs: 

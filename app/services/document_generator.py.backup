@@ -1,0 +1,1657 @@
+"""
+公文Word文档生成器 - 严格按照GB/T9704-2012标准
+"""
+import re
+import logging
+from io import BytesIO
+from typing import List, Dict, Any, Optional
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_BREAK
+from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+from app.utils.text_processor import text_processor
+
+logger = logging.getLogger(__name__)
+
+class OfficialDocumentGenerator:
+    """党政机关公文生成器"""
+    
+    def __init__(self):
+        """初始化文档生成器"""
+        self.document = Document()
+        self._setup_chinese_number_mapping()
+        self._setup_styles()  # 初始化样式
+
+    def _setup_chinese_number_mapping(self):
+        """设置中文数字映射"""
+        self.chinese_numbers = [
+            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+            "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十"
+        ]
+        
+        self.chinese_sub_numbers = [
+            "（一）", "（二）", "（三）", "（四）", "（五）", "（六）", "（七）", "（八）", "（九）", "（十）",
+            "（十一）", "（十二）", "（十三）", "（十四）", "（十五）", "（十六）", "（十七）", "（十八）", "（十九）", "（二十）"
+        ]
+    
+    def generate_document(self, title: str, issuing_department: str, issue_date: str, 
+                         content: str, receiving_department: Optional[str] = None,
+                         has_attachments: bool = False, attachments: Optional[List[Dict]] = None) -> bytes:
+        """
+        生成符合GB/T9704-2012标准的公文
+        
+        Args:
+            title: 文档标题
+            issuing_department: 发文部门
+            issue_date: 发文日期
+            content: 正文内容
+            receiving_department: 收文部门
+            has_attachments: 是否有附件
+            attachments: 附件列表
+            
+        Returns:
+            bytes: 生成的Word文档字节流
+        """
+        try:
+            # 创建新文档
+            self.document = Document()
+            
+            # 设置页面格式
+            self._setup_page_format()
+            
+            # 设置样式
+            self._setup_styles()
+            # 在生成 Word 文档前，应该对内容做一次“清理和去重”，避免发文部门、发文日期、标题等信息重复出现在正文和落款。
+            # 清理和处理内容，确保去除重复的标题
+            cleaned_content = self._clean_content_remove_title(content, title, issuing_department, issue_date, receiving_department)
+            logger.info(f"cleaned_content：{cleaned_content}")
+            # 添加文档标题
+            self._add_document_title(title)
+            
+            # 添加空行
+            self._add_empty_line()
+            
+            # 添加正文内容
+            self._add_document_content(cleaned_content)
+            
+            # 添加附件说明（在正文下方，落款之前）
+            if has_attachments and attachments:
+                self._add_attachment_references(self.document, attachments)
+            
+            # 添加落款
+            self._add_signature(issuing_department, issue_date)
+            
+            # 添加附件内容（另起页）
+            if has_attachments and attachments:
+                for i, attachment in enumerate(attachments, 1):
+                    self._add_attachment_content(attachment, i)
+            
+            # 设置页码
+            self._add_page_numbers()
+            
+            # 保存为字节流
+            document_stream = BytesIO()
+            self.document.save(document_stream)
+            document_stream.seek(0)
+            
+            logger.info("公文文档生成成功")
+            return document_stream.getvalue()
+            
+        except Exception as e:
+            logger.error(f"生成文档时发生错误: {str(e)}")
+            raise
+    
+    def _clean_content_remove_title(self, content: str, title: str, issuing_department: str, issue_date: str, receiving_department: str) -> str:
+        """
+        清理内容，确保去除重复的标题、发文部门、发文日期、收文部门、附件标题
+        
+        Args:
+            content: 原始内容
+            title: 文档标题
+            issuing_department: 发文部门
+            issue_date: 发文日期
+            receiving_department: 收文部门
+
+        Returns:
+            str: 清理后的内容
+        """
+        try:
+            lines = content.split('\n')
+            cleaned_lines = []
+            
+            for line in lines:
+                line_stripped = line.strip()
+                
+                # 跳过与文档标题相同的行（各种格式）
+                if (line_stripped == title or 
+                    line_stripped == f"# {title}" or
+                    line_stripped == f"## {title}" or
+                    line_stripped == f"### {title}" or
+                    line_stripped == issuing_department or
+                    line_stripped == issue_date or
+                    line_stripped == receiving_department):
+                    continue
+                
+                # 跳过明显重复的编号行
+                if self._is_duplicate_numbering(line_stripped):
+                    continue
+                    
+                cleaned_lines.append(line)
+            
+            return '\n'.join(cleaned_lines).strip()
+            
+        except Exception as e:
+            logger.error(f"清理内容时发生错误: {str(e)}")
+            return content
+    
+    
+    def _is_duplicate_numbering(self, line: str) -> bool:
+        """
+        检查是否是重复的编号行
+        
+        Args:
+            line: 要检查的行
+            
+        Returns:
+            bool: 是否是重复编号
+        """
+        try:
+            line = line.strip()
+            
+            # 检查是否有重复的编号模式，如："（一）一、"
+            patterns = [
+                r'（一）\s*一、',  # （一）一、
+                r'（二）\s*二、',  # （二）二、
+                r'（三）\s*三、',  # （三）三、
+                r'（四）\s*四、',  # （四）四、
+                r'（五）\s*五、',  # （五）五、
+            ]
+            
+            import re
+            for pattern in patterns:
+                if re.search(pattern, line):
+                    return True
+            
+            # 检查其他重复模式
+            if re.search(r'（[一二三四五六七八九十]+）\s*[一二三四五六七八九十]+、', line):
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"检查重复编号时发生错误: {str(e)}")
+            return False
+    
+    def _setup_page_format(self):
+        """设置页面格式"""
+        try:
+            # 获取节对象
+            section = self.document.sections[0]
+            
+            # 设置页边距 (GB/T9704-2012: 上下2.54cm，左右3.18cm)
+            section.top_margin = Cm(2.54)
+            section.bottom_margin = Cm(2.54)
+            section.left_margin = Cm(3.18)
+            section.right_margin = Cm(3.18)
+            
+            # 设置页面大小为A4
+            section.page_height = Cm(29.7)
+            section.page_width = Cm(21)
+            
+            logger.info("页面格式设置完成")
+            
+        except Exception as e:
+            logger.error(f"设置页面格式时发生错误: {str(e)}")
+            raise
+    
+    def _setup_styles(self):
+        """设置文档样式"""
+        try:
+            styles = self.document.styles
+            
+            # 1. 标题样式 (方正小标宋简体，二号，行距35磅)
+            if 'DocumentTitle' not in [s.name for s in styles]:
+                title_style = styles.add_style('DocumentTitle', WD_STYLE_TYPE.PARAGRAPH)
+                title_font = title_style.font
+                title_font.name = '方正小标宋简体'
+                title_font.size = Pt(22)  # 二号字体
+                title_font.element.rPr.rFonts.set(qn('w:eastAsia'), '方正小标宋简体')
+                
+                title_paragraph = title_style.paragraph_format
+                title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                title_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                title_paragraph.line_spacing = Pt(35)  # 行距35磅
+                title_paragraph.space_before = Pt(0)
+                title_paragraph.space_after = Pt(0)
+            
+            # 2. 一级标题样式 (黑体，三号)
+            if 'Heading1Official' not in [s.name for s in styles]:
+                h1_style = styles.add_style('Heading1Official', WD_STYLE_TYPE.PARAGRAPH)
+                h1_font = h1_style.font
+                h1_font.name = '黑体'
+                h1_font.size = Pt(16)  # 三号字体
+                h1_font.element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                
+                h1_paragraph = h1_style.paragraph_format
+                h1_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                h1_paragraph.line_spacing = Pt(30)  # 行距30磅
+                h1_paragraph.space_before = Pt(0)
+                h1_paragraph.space_after = Pt(0)
+                h1_paragraph.first_line_indent = Pt(32)  # 首行缩进2字符
+            
+            # 3. 二级标题样式 (楷体_GB2312，三号)
+            if 'Heading2Official' not in [s.name for s in styles]:
+                h2_style = styles.add_style('Heading2Official', WD_STYLE_TYPE.PARAGRAPH)
+                h2_font = h2_style.font
+                h2_font.name = '楷体_GB2312'
+                h2_font.size = Pt(16)  # 三号字体
+                h2_font.element.rPr.rFonts.set(qn('w:eastAsia'), '楷体_GB2312')
+                
+                h2_paragraph = h2_style.paragraph_format
+                h2_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                h2_paragraph.line_spacing = Pt(30)  # 行距30磅
+                h2_paragraph.space_before = Pt(0)
+                h2_paragraph.space_after = Pt(0)
+                h2_paragraph.first_line_indent = Pt(32)  # 首行缩进2字符
+            
+            # 4. 三级标题样式 (仿宋_GB2312，三号，加粗)
+            if 'Heading3Official' not in [s.name for s in styles]:
+                h3_style = styles.add_style('Heading3Official', WD_STYLE_TYPE.PARAGRAPH)
+                h3_font = h3_style.font
+                h3_font.name = '仿宋_GB2312'
+                h3_font.size = Pt(16)  # 三号字体
+                h3_font.bold = True  # 加粗
+                h3_font.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                
+                h3_paragraph = h3_style.paragraph_format
+                h3_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                h3_paragraph.line_spacing = Pt(30)  # 行距30磅
+                h3_paragraph.space_before = Pt(0)
+                h3_paragraph.space_after = Pt(0)
+                h3_paragraph.first_line_indent = Pt(32)  # 首行缩进2字符
+            
+            # 5. 正文样式 (仿宋_GB2312，三号，行距30磅)
+            if 'BodyOfficial' not in [s.name for s in styles]:
+                body_style = styles.add_style('BodyOfficial', WD_STYLE_TYPE.PARAGRAPH)
+                body_font = body_style.font
+                body_font.name = '仿宋_GB2312'
+                body_font.size = Pt(16)  # 三号字体
+                body_font.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                
+                body_paragraph = body_style.paragraph_format
+                body_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                body_paragraph.line_spacing = Pt(30)  # 行距30磅
+                body_paragraph.space_before = Pt(0)
+                body_paragraph.space_after = Pt(0)
+                body_paragraph.first_line_indent = Pt(32)  # 首行缩进2字符
+            
+            # 6. 附件样式 (黑体，三号)
+            if 'AttachmentOfficial' not in [s.name for s in styles]:
+                attach_style = styles.add_style('AttachmentOfficial', WD_STYLE_TYPE.PARAGRAPH)
+                attach_font = attach_style.font
+                attach_font.name = '黑体'
+                attach_font.size = Pt(16)  # 三号字体
+                attach_font.element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                
+                attach_paragraph = attach_style.paragraph_format
+                attach_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                attach_paragraph.line_spacing = Pt(30)  # 行距30磅
+                attach_paragraph.space_before = Pt(0)
+                attach_paragraph.space_after = Pt(0)
+            
+            # 7. 附件标题样式 (黑体，三号，居中)
+            if 'AttachmentTitle' not in [s.name for s in styles]:
+                att_title_style = styles.add_style('AttachmentTitle', WD_STYLE_TYPE.PARAGRAPH)
+                att_title_font = att_title_style.font
+                att_title_font.name = '黑体'
+                att_title_font.size = Pt(16)  # 三号字体
+                att_title_font.bold = True
+                att_title_font.element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                
+                att_title_paragraph = att_title_style.paragraph_format
+                att_title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                att_title_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                att_title_paragraph.line_spacing = Pt(30)  # 行距30磅
+                att_title_paragraph.space_before = Pt(0)
+                att_title_paragraph.space_after = Pt(0)
+                att_title_paragraph.first_line_indent = Pt(0)  # 顶格
+            
+            # 8. 附件内容标题样式 (黑体，三号，居中)
+            if 'AttachmentContentTitle' not in [s.name for s in styles]:
+                att_content_title_style = styles.add_style('AttachmentContentTitle', WD_STYLE_TYPE.PARAGRAPH)
+                att_content_title_font = att_content_title_style.font
+                att_content_title_font.name = '黑体'
+                att_content_title_font.size = Pt(16)  # 三号字体
+                att_content_title_font.element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                
+                att_content_title_paragraph = att_content_title_style.paragraph_format
+                att_content_title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                att_content_title_paragraph.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                att_content_title_paragraph.line_spacing = Pt(30)  # 行距30磅
+                att_content_title_paragraph.space_before = Pt(0)
+                att_content_title_paragraph.space_after = Pt(0)
+            
+            logger.info("文档样式设置完成")
+            
+        except Exception as e:
+            logger.error(f"设置文档样式时发生错误: {str(e)}")
+            raise
+    
+    def _add_document_title(self, title: str):
+        """添加文档标题"""
+        try:
+            # 添加标题段落
+            title_paragraph = self.document.add_paragraph(style='DocumentTitle')
+            
+            # 添加标题文本运行对象，确保字体正确应用
+            title_run = title_paragraph.add_run(title)
+            
+            # 强制设置字体属性
+            title_run.font.name = '方正小标宋简体'
+            title_run.font.size = Pt(22)  # 二号字体
+            title_run.font.element.rPr.rFonts.set(qn('w:eastAsia'), '方正小标宋简体')
+            title_run.font.bold = False
+            
+            # 如果标题过长，进行换行处理，形成梯形或菱形排列
+            if len(title) > 20:
+                # 清除原内容
+                title_paragraph.clear()
+                
+                # 简单的换行处理
+                words = list(title)
+                mid_point = len(words) // 2
+                
+                # 寻找合适的断点
+                break_point = mid_point
+                for i in range(mid_point - 3, mid_point + 4):
+                    if i < len(words) and words[i] in ['的', '关于', '和', '与', '及']:
+                        break_point = i + 1
+                        break
+                
+                if break_point < len(words):
+                    line1 = ''.join(words[:break_point])
+                    line2 = ''.join(words[break_point:])
+                    
+                    # 添加第一行
+                    line1_run = title_paragraph.add_run(line1)
+                    line1_run.font.name = '方正小标宋简体'
+                    line1_run.font.size = Pt(22)
+                    line1_run.font.element.rPr.rFonts.set(qn('w:eastAsia'), '方正小标宋简体')
+                    
+                    # 添加换行
+                    title_paragraph.add_run('\n')
+                    
+                    # 添加第二行
+                    line2_run = title_paragraph.add_run(line2)
+                    line2_run.font.name = '方正小标宋简体'
+                    line2_run.font.size = Pt(22)
+                    line2_run.font.element.rPr.rFonts.set(qn('w:eastAsia'), '方正小标宋简体')
+            
+            logger.info("文档标题添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加文档标题时发生错误: {str(e)}")
+            raise
+    
+    def _add_empty_line(self):
+        """添加空行"""
+        try:
+            empty_paragraph = self.document.add_paragraph()
+            empty_paragraph.style = 'BodyOfficial'
+            
+        except Exception as e:
+            logger.error(f"添加空行时发生错误: {str(e)}")
+    
+    def _add_document_content(self, content: str):
+        """添加文档正文内容"""
+        try:
+            # 格式化内容
+            formatted_content = text_processor.format_content_for_document(content)
+            logger.info(f"formatted_content：{formatted_content}")
+            level1_counter = 0
+            level2_counter = 0
+            level3_counter = 0
+            
+            for item in formatted_content:
+                logger.info(f"item：{item}")
+                if item['type'] == 'header1':
+                    # 一级标题：一、二、三、
+                    level1_counter += 1
+                    level2_counter = 0  # 重置二级计数
+                    level3_counter = 0  # 重置三级计数
+                    
+                    if level1_counter <= len(self.chinese_numbers):
+                        title_text = f"{self.chinese_numbers[level1_counter-1]}、{item['text']}"
+                    else:
+                        title_text = f"{level1_counter}、{item['text']}"
+                    logger.info(f"一级标题：{title_text}")
+                    paragraph = self.document.add_paragraph(style='Heading1Official')
+                    run = paragraph.add_run(title_text)
+                    # 显式设置字体属性
+                    run.font.name = '黑体'
+                    run.font.size = Pt(16)
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                    
+                    # paragraph = self.document.add_paragraph(title_text, style='Heading1Official')
+                    
+                elif item['type'] == 'header2':
+                    # 二级标题：（一）、（二）、（三）
+                    level2_counter += 1
+                    level3_counter = 0  # 重置三级计数
+                    
+                    if level2_counter <= len(self.chinese_sub_numbers):
+                        title_text = f"{self.chinese_sub_numbers[level2_counter-1]}{item['text']}"
+                    else:
+                        title_text = f"（{level2_counter}）{item['text']}"
+                    logger.info(f"二级标题：{title_text}")
+                    paragraph = self.document.add_paragraph(style='Heading2Official')
+                    run = paragraph.add_run(title_text)
+                    # 显式设置字体属性
+                    run.font.name = '楷体_GB2312'
+                    run.font.size = Pt(16)
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '楷体_GB2312')
+                    
+                elif item['type'] == 'header3':
+                    # 三级标题：1.、2.、3.
+                    level3_counter += 1
+                    title_text = f"{level3_counter}.{item['text']}"
+                    
+                    paragraph = self.document.add_paragraph(style='Heading3Official')
+                    run = paragraph.add_run(title_text)
+                    # 显式设置字体属性
+                    run.font.name = '仿宋_GB2312'   
+                    run.font.size = Pt(16)
+                    run.font.bold = True
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                    
+                else:
+                    # 普通段落
+                    paragraph = self.document.add_paragraph(style='BodyOfficial')
+                    run = paragraph.add_run(item['text'])
+                    # 显式设置字体属性
+                    run.font.name = '仿宋_GB2312'
+                    run.font.size = Pt(16)
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+            
+            logger.info("文档内容添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加文档内容时发生错误: {str(e)}")
+            raise
+    
+    def _add_attachment_references(self, doc: Document, attachments: List[Dict]) -> None:
+        """
+        在文档中添加附件引用，严格按照公文格式要求
+        
+        格式要求：
+        - 正文下空一行左空二字编排"附件"二字，后标全角冒号和附件名称
+        - 多个附件使用阿拉伯数字标注顺序
+        - 附件名称后不加标点
+        - 附件名称较长需回行时，应与上一行附件名称的首字对齐
+        
+        Args:
+            doc: Word文档对象
+            attachments: 附件列表
+        """
+        if not attachments:
+            return
+        
+        # 调试信息：打印附件数据结构
+        logger.info(f"_add_attachment_references 收到的附件数据: {attachments}")
+        for i, attachment in enumerate(attachments):
+            logger.info(f"附件 {i+1}: {attachment}")
+            logger.info(f"附件 {i+1} 的keys: {list(attachment.keys()) if isinstance(attachment, dict) else 'Not a dict'}")
+        
+        # 添加空行
+        doc.add_paragraph()
+            
+        # 根据附件数量决定引用格式
+        if len(attachments) == 1:
+            # 只有1个附件：附件：XXX（不写"附件1"）
+            attachment_paragraph = doc.add_paragraph()
+            attachment_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            
+            # 左空二字（32磅）
+            attachment_paragraph.paragraph_format.first_line_indent = Pt(32)
+            
+            # 添加"附件："
+            attachment_run = attachment_paragraph.add_run("附件：")
+            attachment_run.font.name = "仿宋_GB2312"
+            attachment_run.font.size = Pt(16)
+            attachment_run.bold = True
+            # 强制设置字体
+            if attachment_run._element.rPr is not None:
+                attachment_run._element.rPr.rFonts.set(qn('w:ascii'), "仿宋_GB2312")
+                attachment_run._element.rPr.rFonts.set(qn('w:eastAsia'), "仿宋_GB2312")
+                attachment_run._element.rPr.rFonts.set(qn('w:hAnsi'), "仿宋_GB2312")
+            
+            # 获取附件标题
+            logger.info(f"获取单个附件标题，附件数据: {attachments[0]}")
+            attachment_title = attachments[0].get('extracted_title', attachments[0].get('title', attachments[0].get('name', '附件')))
+            logger.info(f"单个附件标题: {attachment_title}")
+            
+            # 添加附件标题（不加标点）
+            title_run = attachment_paragraph.add_run(attachment_title)
+            title_run.font.name = "仿宋_GB2312"
+            title_run.font.size = Pt(16)
+            # 强制设置字体
+            if title_run._element.rPr is not None:
+                title_run._element.rPr.rFonts.set(qn('w:ascii'), "仿宋_GB2312")
+                title_run._element.rPr.rFonts.set(qn('w:eastAsia'), "仿宋_GB2312")
+                title_run._element.rPr.rFonts.set(qn('w:hAnsi'), "仿宋_GB2312")
+            
+        else:
+            # 多个附件：使用阿拉伯数字标注顺序
+            for i, attachment in enumerate(attachments, 1):
+                attachment_paragraph = doc.add_paragraph()
+                attachment_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                
+                if i == 1:
+                    # 第一个附件：左空二字 + "附件1、"
+                    attachment_paragraph.paragraph_format.first_line_indent = Pt(32)
+                    
+                    # 添加"附件1、"
+                    attachment_run = attachment_paragraph.add_run(f"附件{i}、")
+                    attachment_run.font.name = "仿宋_GB2312"
+                    attachment_run.font.size = Pt(16)
+                    attachment_run.bold = True
+                    # 强制设置字体
+                    if attachment_run._element.rPr is not None:
+                        attachment_run._element.rPr.rFonts.set(qn('w:ascii'), "仿宋_GB2312")
+                        attachment_run._element.rPr.rFonts.set(qn('w:eastAsia'), "仿宋_GB2312")
+                        attachment_run._element.rPr.rFonts.set(qn('w:hAnsi'), "仿宋_GB2312")
+                    
+                else:
+                    # 后续附件：与上一行附件名称首字对齐
+                    # 计算缩进：左空二字(32磅) + "附件1、"(48磅) = 80磅
+                    attachment_paragraph.paragraph_format.first_line_indent = Pt(80)
+                    
+                    # 添加序号
+                    number_run = attachment_paragraph.add_run(f"附件{i}、")
+                    number_run.font.name = "仿宋_GB2312"
+                    number_run.font.size = Pt(16)
+                    number_run.bold = True
+                    # 强制设置字体
+                    if number_run._element.rPr is not None:
+                        number_run._element.rPr.rFonts.set(qn('w:ascii'), "仿宋_GB2312")
+                        number_run._element.rPr.rFonts.set(qn('w:eastAsia'), "仿宋_GB2312")
+                        number_run._element.rPr.rFonts.set(qn('w:hAnsi'), "仿宋_GB2312")
+                
+                # 获取附件标题
+                logger.info(f"获取多个附件标题，附件{i}数据: {attachment}")
+                attachment_title = attachment.get('extracted_title', attachment.get('title', attachment.get('name', f'附件{i}')))
+                logger.info(f"多个附件标题{i}: {attachment_title}")
+                
+                # 添加附件标题（不加标点）
+                title_run = attachment_paragraph.add_run(attachment_title)
+                title_run.font.name = "仿宋_GB2312"
+                title_run.font.size = Pt(16)
+                # 强制设置字体
+                if title_run._element.rPr is not None:
+                    title_run._element.rPr.rFonts.set(qn('w:ascii'), "仿宋_GB2312")
+                    title_run._element.rPr.rFonts.set(qn('w:eastAsia'), "仿宋_GB2312")
+                    title_run._element.rPr.rFonts.set(qn('w:hAnsi'), "仿宋_GB2312")
+    
+    def _add_signature(self, issuing_department: str, issue_date: str):
+        """添加落款"""
+        try:
+            # 添加两个空行
+            self._add_empty_line()
+            self._add_empty_line()
+            
+            # 添加发文部门（右对齐）
+            dept_paragraph = self.document.add_paragraph(issuing_department, style='BodyOfficial')
+            dept_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            dept_paragraph.paragraph_format.first_line_indent = Pt(0)
+            
+            # 添加发文日期（右对齐）
+            date_paragraph = self.document.add_paragraph(issue_date, style='BodyOfficial')
+            date_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            date_paragraph.paragraph_format.first_line_indent = Pt(0)
+            
+            logger.info("落款添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加落款时发生错误: {str(e)}")
+            raise
+    
+    def _add_attachment_pages(self, attachments: List[Dict]):
+        """
+        添加附件页面（另起页）
+        
+        Args:
+            attachments: 附件列表
+        """
+        try:
+            for i, attachment in enumerate(attachments, 1):
+                # 添加分页符（另起页）
+                self.document.add_page_break()
+                
+                # 添加"附件"标识（顶格，版心左上角第一行）
+                attach_label = self.document.add_paragraph(f"附件{i}", style='AttachmentTitle')
+                
+                # 添加空行
+                self._add_empty_line()
+                
+                # 添加附件标题（居中，版心第三行）
+                attach_title = self.document.add_paragraph(attachment.get('name', f'附件{i}'), style='AttachmentContentTitle')
+                
+                # 添加空行
+                self._add_empty_line()
+                
+                # 添加附件内容
+                self._add_attachment_content(attachment, i)
+            
+            logger.info("附件页面添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加附件页面时发生错误: {str(e)}")
+    
+    def _add_attachment_content(self, attachment: Dict, attachment_number: int = 1):
+        """
+        添加附件内容，支持原样格式输出
+        按照公文格式要求：
+        - "附件"在另起页用三号黑体字顶格编排在版心左上角第一行
+        - 附件标题居中编排在版心第三行
+        - 附件顺序号和附件标题应当与附件说明的表述一致
+        
+        Args:
+            attachment: 附件信息
+            attachment_number: 附件序号
+        """
+        try:
+            # 调试信息：打印附件数据结构
+            logger.info(f"_add_attachment_content 收到的附件数据: {attachment}")
+            logger.info(f"_add_attachment_content 附件的keys: {list(attachment.keys()) if isinstance(attachment, dict) else 'Not a dict'}")
+            
+            attach_type = attachment.get('type', 'text')
+            
+            logger.info(f"开始添加附件内容，类型: {attach_type}")
+            
+            # 添加分页符（另起页）
+            self._add_page_break()
+            
+            if attach_type == 'word':
+                # Word文档内容，如果有原始内容则直接拼接，保持原有格式
+                if 'content' in attachment:
+                    # 添加"附件"标识（顶格，版心左上角第一行，三号黑体字）
+                    self._add_attachment_header(attachment_number)
+                    
+                    # 添加空行（版心第二行）
+                    self._add_empty_line()
+                    
+                    # 直接拼接Word文档内容，不添加额外标题
+                    # Word文档中的原始标题会自动保持原有格式
+                    self._merge_word_document(attachment['content'])
+                else:
+                    # 如果没有原始Word内容，则添加标题
+                    self._add_attachment_header(attachment_number)
+                    self._add_empty_line()
+                    attachment_title = attachment.get('extracted_title', attachment.get('title', attachment.get('name', '附件')))
+                    self._add_attachment_title(attachment_title)
+                    
+                    content = attachment.get('markdown_content', '')
+                    self._add_word_content(content)
+            else:
+                # 非Word文档，需要添加标题
+                self._add_attachment_header(attachment_number)
+                self._add_empty_line()
+                attachment_title = attachment.get('extracted_title', attachment.get('title', attachment.get('name', '附件')))
+                self._add_attachment_title(attachment_title)
+                
+                if attach_type == 'csv' or attach_type == 'excel':
+                    content = attachment.get('markdown_content', '')
+                    self._add_table_from_markdown(content)
+                else:
+                    # 普通文本内容
+                    content = attachment.get('markdown_content', '')
+                    self._add_text_content(content)
+            
+        except Exception as e:
+            logger.error(f"添加附件内容时发生错误: {str(e)}")
+    
+    def _add_attachment_header(self, attachment_number: int = 1):
+        """
+        添加"附件"标识，按照公文格式要求：
+        - 用三号黑体字顶格编排在版心左上角第一行
+        - 多个附件时标记序号
+        
+        Args:
+            attachment_number: 附件序号
+        """
+        try:
+            # 添加"附件"标识段落
+            header_paragraph = self.document.add_paragraph()
+            header_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            
+            # 顶格编排（无缩进）
+            header_paragraph.paragraph_format.first_line_indent = Pt(0)
+            header_paragraph.paragraph_format.left_indent = Pt(0)
+            
+            # 添加"附件"文字和序号
+            header_text = f"附件{attachment_number}"
+            header_run = header_paragraph.add_run(header_text)
+            
+            # 设置字体属性：三号黑体字
+            header_run.font.name = '黑体'
+            header_run.font.size = Pt(16)  # 三号字体
+            header_run.font.bold = True
+            # 强制设置字体
+            if header_run._element.rPr is not None:
+                header_run._element.rPr.rFonts.set(qn('w:ascii'), '黑体')
+                header_run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                header_run._element.rPr.rFonts.set(qn('w:hAnsi'), '黑体')
+            
+        except Exception as e:
+            logger.error(f"添加附件标识时发生错误: {str(e)}")
+    
+    def _add_attachment_title(self, title: str):
+        """
+        添加附件标题，按照公文格式要求：
+        - 居中编排在版心第三行
+        
+        Args:
+            title: 附件标题
+        """
+        try:
+            # 添加附件标题段落
+            title_paragraph = self.document.add_paragraph()
+            title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 添加标题文字
+            title_run = title_paragraph.add_run(title)
+            
+            # 设置字体属性：三号黑体字
+            title_run.font.name = '黑体'
+            title_run.font.size = Pt(16)  # 三号字体
+            title_run.font.bold = True
+            # 强制设置字体
+            if title_run._element.rPr is not None:
+                title_run._element.rPr.rFonts.set(qn('w:ascii'), '黑体')
+                title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                title_run._element.rPr.rFonts.set(qn('w:hAnsi'), '黑体')
+            
+            # 添加空行
+            self._add_empty_line()
+            
+        except Exception as e:
+            logger.error(f"添加附件标题时发生错误: {str(e)}")
+    
+    def _add_page_break(self):
+        """
+        添加分页符
+        """
+        try:
+            # 添加分页符
+            paragraph = self.document.add_paragraph()
+            run = paragraph.add_run()
+            run.add_break(WD_BREAK.PAGE)
+            
+        except Exception as e:
+            logger.error(f"添加分页符时发生错误: {str(e)}")
+    
+    def _merge_word_document(self, word_content: bytes):
+        """
+        将Word文档内容拼接到当前文档中，保持原有格式
+        使用更稳定的方法来处理段落和表格
+        
+        Args:
+            word_content: Word文档的二进制内容
+        """
+        try:
+            # 从二进制内容创建Word文档对象
+            attachment_doc = Document(BytesIO(word_content))
+            
+            logger.info(f"开始拼接Word文档，段落数: {len(attachment_doc.paragraphs)}, 表格数: {len(attachment_doc.tables)}")
+            
+            # 方法1：逐个处理段落和表格，保持原有顺序
+            self._merge_document_elements(attachment_doc)
+            
+            logger.info("Word文档拼接完成")
+            
+        except Exception as e:
+            logger.error(f"拼接Word文档时发生错误: {str(e)}")
+            # 如果拼接失败，尝试提取文本内容
+            try:
+                attachment_doc = Document(BytesIO(word_content))
+                self._extract_and_add_content(attachment_doc)
+            except Exception as e2:
+                logger.error(f"提取Word文档文本内容也失败: {str(e2)}")
+    
+    def _merge_document_elements(self, source_doc: Document):
+        """
+        合并文档元素，保持原有顺序和格式
+        使用更精确的方法来处理文档元素的顺序
+        
+        Args:
+            source_doc: 源文档对象
+        """
+        try:
+            # 使用更精确的方法来获取文档元素的顺序
+            # 通过XML结构来确定元素的正确顺序
+            body = source_doc.element.body
+            
+            for element in body:
+                if element.tag.endswith('p'):  # 段落元素
+                    # 找到对应的段落对象
+                    for para in source_doc.paragraphs:
+                        if para._element == element:
+                            text = para.text.strip()
+                            if text:  # 只处理非空段落
+                                self._add_paragraph_with_style(para)
+                            break
+                
+                elif element.tag.endswith('tbl'):  # 表格元素
+                    # 找到对应的表格对象
+                    for table in source_doc.tables:
+                        if table._element == element:
+                            self._add_table_with_format(table)
+                            break
+            
+        except Exception as e:
+            logger.error(f"合并文档元素时发生错误: {str(e)}")
+            # 如果精确方法失败，回退到原来的方法
+            try:
+                # 先处理段落
+                for para in source_doc.paragraphs:
+                    text = para.text.strip()
+                    if text:  # 只处理非空段落
+                        self._add_paragraph_with_style(para)
+                
+                # 再处理表格
+                for table in source_doc.tables:
+                    self._add_table_with_format(table)
+            except Exception as e2:
+                logger.error(f"回退方法也失败: {str(e2)}")
+    
+    def _add_paragraph_with_style(self, source_para):
+        """
+        添加段落并尝试保持样式
+        
+        Args:
+            source_para: 源段落对象
+        """
+        try:
+            text = source_para.text.strip()
+            if not text:
+                return
+            
+            # 创建新段落
+            new_para = self.document.add_paragraph()
+            
+            # 复制段落格式
+            try:
+                # 复制对齐方式
+                if hasattr(source_para, 'alignment') and source_para.alignment is not None:
+                    new_para.alignment = source_para.alignment
+                
+                # 复制段落格式
+                if hasattr(source_para, 'paragraph_format'):
+                    pf = source_para.paragraph_format
+                    new_pf = new_para.paragraph_format
+                    
+                    # 复制缩进
+                    if pf.left_indent is not None:
+                        new_pf.left_indent = pf.left_indent
+                    if pf.right_indent is not None:
+                        new_pf.right_indent = pf.right_indent
+                    if pf.first_line_indent is not None:
+                        new_pf.first_line_indent = pf.first_line_indent
+                    
+                    # 复制行间距
+                    if pf.line_spacing is not None:
+                        new_pf.line_spacing = pf.line_spacing
+                    
+                    # 复制段前段后间距
+                    if pf.space_before is not None:
+                        new_pf.space_before = pf.space_before
+                    if pf.space_after is not None:
+                        new_pf.space_after = pf.space_after
+            except Exception as format_error:
+                logger.warning(f"复制段落格式时发生错误: {str(format_error)}")
+            
+            # 复制文本和字体格式
+            if source_para.runs:
+                # 如果有runs，逐个复制
+                for source_run in source_para.runs:
+                    if source_run.text:
+                        new_run = new_para.add_run(source_run.text)
+                        
+                        # 复制字体格式
+                        try:
+                            if hasattr(source_run, 'font'):
+                                sf = source_run.font
+                                nf = new_run.font
+                                
+                                # 复制字体属性
+                                if sf.name:
+                                    nf.name = sf.name
+                                else:
+                                    nf.name = '仿宋_GB2312'  # 默认字体
+                                
+                                if sf.size:
+                                    nf.size = sf.size
+                                else:
+                                    nf.size = Pt(16)  # 默认字号
+                                
+                                if sf.bold is not None:
+                                    nf.bold = sf.bold
+                                if sf.italic is not None:
+                                    nf.italic = sf.italic
+                                if sf.underline is not None:
+                                    nf.underline = sf.underline
+                                
+                                # 强制设置字体（确保在所有情况下都能正确显示）
+                                if new_run._element.rPr is not None:
+                                    font_name = sf.name if sf.name else '仿宋_GB2312'
+                                    new_run._element.rPr.rFonts.set(qn('w:ascii'), font_name)
+                                    new_run._element.rPr.rFonts.set(qn('w:eastAsia'), font_name)
+                                    new_run._element.rPr.rFonts.set(qn('w:hAnsi'), font_name)
+                        except Exception as font_error:
+                            logger.warning(f"复制字体格式时发生错误: {str(font_error)}")
+                            # 设置默认字体
+                            new_run.font.name = '仿宋_GB2312'
+                            new_run.font.size = Pt(16)
+            else:
+                # 如果没有runs，直接添加文本
+                new_run = new_para.add_run(text)
+                new_run.font.name = '仿宋_GB2312'
+                new_run.font.size = Pt(16)
+                if new_run._element.rPr is not None:
+                    new_run._element.rPr.rFonts.set(qn('w:ascii'), '仿宋_GB2312')
+                    new_run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                    new_run._element.rPr.rFonts.set(qn('w:hAnsi'), '仿宋_GB2312')
+            
+        except Exception as e:
+            logger.error(f"添加段落时发生错误: {str(e)}")
+    
+    def _add_table_with_format(self, source_table):
+        """
+        添加表格并尝试保持格式
+        
+        Args:
+            source_table: 源表格对象
+        """
+        try:
+            # 获取表格数据和格式
+            rows_data = []
+            cell_formats = []
+            
+            for row_idx, row in enumerate(source_table.rows):
+                row_data = []
+                row_formats = []
+                
+                for cell_idx, cell in enumerate(row.cells):
+                    cell_text = cell.text.strip()
+                    row_data.append(cell_text)
+                    
+                    # 获取单元格格式信息
+                    cell_format = {
+                        'paragraphs': [],
+                        'width': None,
+                        'vertical_alignment': None,
+                        'is_merged': False,
+                        'grid_span': 1,
+                        'v_merge': None
+                    }
+                    
+                    # 收集段落信息
+                    for para in cell.paragraphs:
+                        para_info = {
+                            'text': para.text,
+                            'alignment': para.alignment,
+                            'runs': []
+                        }
+                        
+                        # 收集run信息
+                        for run in para.runs:
+                            if run.text:
+                                run_info = {
+                                    'text': run.text,
+                                    'font_name': run.font.name,
+                                    'font_size': run.font.size,
+                                    'bold': run.font.bold,
+                                    'italic': run.font.italic,
+                                    'underline': run.font.underline
+                                }
+                                para_info['runs'].append(run_info)
+                        
+                        cell_format['paragraphs'].append(para_info)
+                    
+                    # 获取单元格宽度
+                    try:
+                        cell_format['width'] = cell.width
+                    except:
+                        pass
+                    
+                    # 获取垂直对齐方式
+                    try:
+                        cell_format['vertical_alignment'] = cell.vertical_alignment
+                    except:
+                        pass
+                    
+                    # 检查单元格合并信息
+                    try:
+                        # 检查水平合并（gridSpan）
+                        tc = cell._tc
+                        tcPr = tc.tcPr
+                        if tcPr is not None:
+                            gridSpan = tcPr.find(qn('w:gridSpan'))
+                            if gridSpan is not None:
+                                cell_format['grid_span'] = int(gridSpan.get(qn('w:val'), 1))
+                                cell_format['is_merged'] = True
+                            
+                            # 检查垂直合并（vMerge）
+                            vMerge = tcPr.find(qn('w:vMerge'))
+                            if vMerge is not None:
+                                cell_format['v_merge'] = vMerge.get(qn('w:val'), 'continue')
+                                cell_format['is_merged'] = True
+                    except Exception as merge_error:
+                        logger.warning(f"检查单元格合并信息时发生错误: {str(merge_error)}")
+                    
+                    row_formats.append(cell_format)
+                
+                rows_data.append(row_data)
+                cell_formats.append(row_formats)
+            
+            if not rows_data:
+                return
+            
+            # 创建新表格
+            table = self.document.add_table(rows=len(rows_data), cols=len(rows_data[0]))
+            
+            # 设置表格样式 - 使用更接近原始格式的样式
+            table.style = 'Table Grid'
+            
+            # 尝试复制表格整体格式
+            try:
+                if hasattr(source_table, 'alignment'):
+                    table.alignment = source_table.alignment
+                
+                # 复制表格宽度
+                if hasattr(source_table, 'width'):
+                    table.width = source_table.width
+                    
+                # 设置表格边框
+                from docx.oxml import OxmlElement
+                
+                # 设置表格边框样式
+                tbl = table._tbl
+                tblPr = tbl.tblPr
+                
+                # 添加边框设置
+                tblBorders = OxmlElement('w:tblBorders')
+                
+                # 设置所有边框
+                for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+                    border = OxmlElement(f'w:{border_name}')
+                    border.set(qn('w:val'), 'single')
+                    border.set(qn('w:sz'), '4')
+                    border.set(qn('w:space'), '0')
+                    border.set(qn('w:color'), '000000')
+                    tblBorders.append(border)
+                
+                tblPr.append(tblBorders)
+                
+            except Exception as border_error:
+                logger.warning(f"设置表格边框时发生错误: {str(border_error)}")
+            
+            # 填充表格数据和格式
+            for i, (row_data, row_formats) in enumerate(zip(rows_data, cell_formats)):
+                for j, (cell_text, cell_format) in enumerate(zip(row_data, row_formats)):
+                    if j < len(table.rows[i].cells):
+                        cell = table.rows[i].cells[j]
+                        
+                        # 清空默认段落
+                        cell.paragraphs[0].clear()
+                        
+                        # 设置单元格垂直对齐方式
+                        try:
+                            if cell_format['vertical_alignment'] is not None:
+                                cell.vertical_alignment = cell_format['vertical_alignment']
+                        except:
+                            pass
+                        
+                        # 设置单元格宽度
+                        try:
+                            if cell_format['width'] is not None:
+                                cell.width = cell_format['width']
+                        except:
+                            pass
+                        
+                        # 处理单元格合并
+                        try:
+                            if cell_format['is_merged']:
+                                tc = cell._tc
+                                tcPr = tc.tcPr
+                                if tcPr is None:
+                                    tcPr = OxmlElement('w:tcPr')
+                                    tc.append(tcPr)
+                                
+                                # 设置水平合并
+                                if cell_format['grid_span'] > 1:
+                                    gridSpan = OxmlElement('w:gridSpan')
+                                    gridSpan.set(qn('w:val'), str(cell_format['grid_span']))
+                                    tcPr.append(gridSpan)
+                                
+                                # 设置垂直合并
+                                if cell_format['v_merge'] is not None:
+                                    vMerge = OxmlElement('w:vMerge')
+                                    if cell_format['v_merge'] != 'continue':
+                                        vMerge.set(qn('w:val'), cell_format['v_merge'])
+                                    tcPr.append(vMerge)
+                        except Exception as merge_error:
+                            logger.warning(f"设置单元格合并时发生错误: {str(merge_error)}")
+                        
+                        # 设置单元格边框
+                        try:
+                            tc = cell._tc
+                            tcPr = tc.tcPr
+                            if tcPr is None:
+                                tcPr = OxmlElement('w:tcPr')
+                                tc.append(tcPr)
+                            
+                            # 添加单元格边框
+                            tcBorders = OxmlElement('w:tcBorders')
+                            for border_name in ['top', 'left', 'bottom', 'right']:
+                                border = OxmlElement(f'w:{border_name}')
+                                border.set(qn('w:val'), 'single')
+                                border.set(qn('w:sz'), '4')
+                                border.set(qn('w:space'), '0')
+                                border.set(qn('w:color'), '000000')
+                                tcBorders.append(border)
+                            tcPr.append(tcBorders)
+                        except Exception as cell_border_error:
+                            logger.warning(f"设置单元格边框时发生错误: {str(cell_border_error)}")
+                        
+                        # 添加段落内容
+                        for para_idx, para_info in enumerate(cell_format['paragraphs']):
+                            if para_idx == 0:
+                                # 使用第一个段落
+                                para = cell.paragraphs[0]
+                            else:
+                                # 添加新段落
+                                para = cell.add_paragraph()
+                            
+                            # 设置段落对齐方式
+                            if para_info['alignment'] is not None:
+                                para.alignment = para_info['alignment']
+                            
+                            # 设置段落格式（行间距等）
+                            try:
+                                pf = para.paragraph_format
+                                # 设置行间距为单倍行距
+                                pf.line_spacing = 1.0
+                                # 设置段前段后间距
+                                pf.space_before = Pt(0)
+                                pf.space_after = Pt(0)
+                            except Exception as pf_error:
+                                logger.warning(f"设置段落格式时发生错误: {str(pf_error)}")
+                            
+                            # 添加runs
+                            if para_info['runs']:
+                                for run_info in para_info['runs']:
+                                    run = para.add_run(run_info['text'])
+                                    
+                                    # 设置字体格式
+                                    if run_info['font_name']:
+                                        run.font.name = run_info['font_name']
+                                    else:
+                                        run.font.name = '仿宋_GB2312'
+                                    
+                                    if run_info['font_size']:
+                                        run.font.size = run_info['font_size']
+                                    else:
+                                        run.font.size = Pt(16)
+                                    
+                                    if run_info['bold'] is not None:
+                                        run.font.bold = run_info['bold']
+                                    if run_info['italic'] is not None:
+                                        run.font.italic = run_info['italic']
+                                    if run_info['underline'] is not None:
+                                        run.font.underline = run_info['underline']
+                                    
+                                    # 强制设置字体
+                                    if run._element.rPr is not None:
+                                        font_name = run_info['font_name'] if run_info['font_name'] else '仿宋_GB2312'
+                                        run._element.rPr.rFonts.set(qn('w:ascii'), font_name)
+                                        run._element.rPr.rFonts.set(qn('w:eastAsia'), font_name)
+                                        run._element.rPr.rFonts.set(qn('w:hAnsi'), font_name)
+                            else:
+                                # 如果没有runs，直接添加文本
+                                if para_info['text']:
+                                    run = para.add_run(para_info['text'])
+                                    run.font.name = '仿宋_GB2312'
+                                    run.font.size = Pt(16)
+                                    if run._element.rPr is not None:
+                                        run._element.rPr.rFonts.set(qn('w:ascii'), '仿宋_GB2312')
+                                        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                                        run._element.rPr.rFonts.set(qn('w:hAnsi'), '仿宋_GB2312')
+            
+            # 添加表格后的空行
+            self._add_empty_line()
+            
+        except Exception as e:
+            logger.error(f"添加表格时发生错误: {str(e)}")
+            # 如果复杂格式复制失败，回退到简单方法
+            try:
+                self._add_simple_table(source_table)
+            except Exception as e2:
+                logger.error(f"简单表格添加也失败: {str(e2)}")
+    
+    def _add_simple_table(self, source_table):
+        """
+        添加简单表格（回退方法）
+        
+        Args:
+            source_table: 源表格对象
+        """
+        try:
+            # 获取表格数据
+            rows_data = []
+            for row in source_table.rows:
+                row_data = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    row_data.append(cell_text)
+                rows_data.append(row_data)
+            
+            if not rows_data:
+                return
+            
+            # 创建新表格
+            table = self.document.add_table(rows=len(rows_data), cols=len(rows_data[0]))
+            table.style = 'Table Grid'
+            
+            # 填充表格数据
+            for i, row_data in enumerate(rows_data):
+                for j, cell_text in enumerate(row_data):
+                    if j < len(table.rows[i].cells):
+                        cell = table.rows[i].cells[j]
+                        cell.text = cell_text
+                        
+                        # 设置单元格字体
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.name = '仿宋_GB2312'
+                                run.font.size = Pt(16)
+                                if run._element.rPr is not None:
+                                    run._element.rPr.rFonts.set(qn('w:ascii'), '仿宋_GB2312')
+                                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+                                    run._element.rPr.rFonts.set(qn('w:hAnsi'), '仿宋_GB2312')
+            
+            # 添加表格后的空行
+            self._add_empty_line()
+            
+        except Exception as e:
+            logger.error(f"添加简单表格时发生错误: {str(e)}")
+    
+    def _extract_and_add_content(self, source_doc: Document):
+        """
+        提取文档内容并添加到当前文档
+        
+        Args:
+            source_doc: 源文档对象
+        """
+        try:
+            # 提取段落内容
+            for para in source_doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    new_para = self.document.add_paragraph(text, style='BodyOfficial')
+                    for run in new_para.runs:
+                        run.font.name = '仿宋_GB2312'
+                        run.font.size = Pt(16)
+                        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+            
+            # 提取表格内容
+            for table in source_doc.tables:
+                self._add_table_with_format(table)
+            
+        except Exception as e:
+            logger.error(f"提取文档内容时发生错误: {str(e)}")
+    
+    def _copy_paragraph_with_format(self, source_para_element):
+        """
+        复制段落元素到当前文档，保持格式
+        
+        Args:
+            source_para_element: 源段落元素
+        """
+        try:
+            # 在当前文档中创建新段落
+            new_para = self.document.add_paragraph()
+            
+            # 复制段落的XML内容，保持完整格式
+            new_para._element.clear()
+            
+            # 深度复制元素
+            import copy
+            copied_element = copy.deepcopy(source_para_element)
+            
+            # 将复制的元素添加到新段落
+            for child in copied_element:
+                new_para._element.append(child)
+            
+        except Exception as e:
+            logger.error(f"复制段落时发生错误: {str(e)}")
+            # 如果复制失败，尝试提取文本内容
+            try:
+                from docx.oxml import parse_xml
+                text_content = source_para_element.text if hasattr(source_para_element, 'text') else ''
+                if text_content:
+                    fallback_para = self.document.add_paragraph(text_content, style='BodyOfficial')
+            except:
+                pass
+    
+    def _copy_table_with_format(self, source_table_element):
+        """
+        复制表格元素到当前文档，保持格式
+        
+        Args:
+            source_table_element: 源表格元素
+        """
+        try:
+            # 创建表格容器段落
+            table_para = self.document.add_paragraph()
+            
+            # 清空段落内容
+            table_para._element.clear()
+            
+            # 深度复制表格元素
+            import copy
+            copied_table = copy.deepcopy(source_table_element)
+            
+            # 将复制的表格添加到段落
+            table_para._element.append(copied_table)
+            
+        except Exception as e:
+            logger.error(f"复制表格时发生错误: {str(e)}")
+            # 如果复制失败，尝试提取表格内容并重新创建
+            try:
+                self._extract_and_recreate_table(source_table_element)
+            except:
+                pass
+    
+    def _copy_element_with_format(self, source_element):
+        """
+        复制其他元素到当前文档
+        
+        Args:
+            source_element: 源元素
+        """
+        try:
+            # 创建一个容器段落
+            container_para = self.document.add_paragraph()
+            
+            # 清空段落内容
+            container_para._element.clear()
+            
+            # 深度复制元素
+            import copy
+            copied_element = copy.deepcopy(source_element)
+            
+            # 将复制的元素添加到容器
+            container_para._element.append(copied_element)
+            
+        except Exception as e:
+            logger.error(f"复制元素时发生错误: {str(e)}")
+    
+    def _extract_and_recreate_table(self, source_table_element):
+        """
+        提取表格内容并重新创建表格
+        
+        Args:
+            source_table_element: 源表格元素
+        """
+        try:
+            # 这里可以添加表格提取和重建逻辑
+            # 如果需要更复杂的表格处理，可以在这里实现
+            pass
+        except Exception as e:
+            logger.error(f"重新创建表格时发生错误: {str(e)}")
+    
+    def _add_page_numbers(self):
+        """
+        为整个文档添加连续页码
+        """
+        try:
+            # 获取文档的第一个节
+            section = self.document.sections[0]
+            
+            # 获取页脚
+            footer = section.footer
+            
+            # 清空现有页脚内容
+            footer._element.clear()
+            
+            # 创建页脚段落
+            footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+            footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 添加页码字段
+            run = footer_para.add_run()
+            
+            # 创建页码字段的XML
+            fldChar1 = OxmlElement('w:fldChar')
+            fldChar1.set(qn('w:fldCharType'), 'begin')
+            
+            instrText = OxmlElement('w:instrText')
+            instrText.text = 'PAGE'
+            
+            fldChar2 = OxmlElement('w:fldChar')
+            fldChar2.set(qn('w:fldCharType'), 'end')
+            
+            # 添加到run中
+            run._element.append(fldChar1)
+            run._element.append(instrText)
+            run._element.append(fldChar2)
+            
+            # 设置页码字体
+            run.font.name = '仿宋_GB2312'
+            run.font.size = Pt(14)
+            
+            logger.info("页码添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加页码时发生错误: {str(e)}")
+    
+    def _add_word_content(self, content: str):
+        """
+        添加Word文档内容，保持原样格式
+        
+        Args:
+            content: Word文档提取的内容
+        """
+        try:
+            # 按段落分割内容
+            paragraphs = content.split('\n\n')
+            
+            for paragraph_content in paragraphs:
+                paragraph_content = paragraph_content.strip()
+                if not paragraph_content:
+                    continue
+                
+                # 检查是否是表格内容
+                if '|' in paragraph_content and '---' in paragraph_content:
+                    # 表格内容，单独处理
+                    self._add_table_from_markdown(paragraph_content)
+                else:
+                    # 普通段落内容
+                    lines = paragraph_content.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line:
+                            # 检查是否是标题行（简单判断）
+                            if self._is_title_line(line):
+                                # 使用附件标题样式
+                                paragraph = self.document.add_paragraph(style='AttachmentTitle')
+                                run = paragraph.add_run(line)
+                                run.font.name = '黑体'
+                                run.font.size = Pt(16)
+                                run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                            else:
+                                # 使用正文样式
+                                paragraph = self.document.add_paragraph(style='BodyOfficial')
+                                run = paragraph.add_run(line)
+                                run.font.name = '仿宋_GB2312'
+                                run.font.size = Pt(16)
+                                run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+            
+        except Exception as e:
+            logger.error(f"添加Word内容时发生错误: {str(e)}")
+    
+    def _add_text_content(self, content: str):
+        """
+        添加普通文本内容
+        
+        Args:
+            content: 文本内容
+        """
+        try:
+            lines = content.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line:
+                    paragraph = self.document.add_paragraph(style='BodyOfficial')
+                    run = paragraph.add_run(line)
+                    run.font.name = '仿宋_GB2312'
+                    run.font.size = Pt(16)
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋_GB2312')
+            
+        except Exception as e:
+            logger.error(f"添加文本内容时发生错误: {str(e)}")
+    
+    def _is_title_line(self, line: str) -> bool:
+        """
+        判断是否是标题行
+        
+        Args:
+            line: 文本行
+            
+        Returns:
+            bool: 是否是标题行
+        """
+        # 简单的标题判断规则
+        title_patterns = [
+            r'^第[一二三四五六七八九十]+章',  # 第X章
+            r'^第[一二三四五六七八九十]+节',  # 第X节
+            r'^[一二三四五六七八九十]+、',    # 一、二、三、
+            r'^（[一二三四五六七八九十]+）',  # （一）（二）（三）
+            r'^\d+\.',                      # 1. 2. 3.
+            r'^[A-Z]+\.',                   # A. B. C.
+        ]
+        
+        for pattern in title_patterns:
+            if re.match(pattern, line):
+                return True
+        
+        # 如果行长度较短且不包含标点符号，可能是标题
+        if len(line) < 20 and not any(punct in line for punct in ['。', '，', '；', '：', '？', '！']):
+            return True
+        
+        return False
+    
+    def _add_table_from_markdown(self, markdown_table: str):
+        """
+        从markdown表格创建Word表格
+        
+        Args:
+            markdown_table: markdown格式的表格
+        """
+        try:
+            lines = [line.strip() for line in markdown_table.split('\n') if line.strip()]
+            if len(lines) < 2:
+                return
+            
+            # 解析表格头部
+            headers = [cell.strip() for cell in lines[0].split('|') if cell.strip()]
+            if not headers:
+                return
+            
+            # 跳过分隔线
+            data_lines = [line for line in lines[2:] if '|' in line]
+            
+            # 创建表格
+            table = self.document.add_table(rows=1, cols=len(headers))
+            table.style = 'Table Grid'
+            
+            # 设置表头
+            hdr_cells = table.rows[0].cells
+            for i, header in enumerate(headers):
+                if i < len(hdr_cells):
+                    hdr_cells[i].text = header
+                    # 设置表头字体
+                    for paragraph in hdr_cells[i].paragraphs:
+                        for run in paragraph.runs:
+                            run.font.name = '仿宋_GB2312'
+                            run.font.size = Pt(16)
+                            run.font.bold = True
+            
+            # 添加数据行
+            for line in data_lines:
+                cells_data = [cell.strip() for cell in line.split('|') if cell.strip()]
+                if cells_data:
+                    row_cells = table.add_row().cells
+                    for i, cell_data in enumerate(cells_data):
+                        if i < len(row_cells):
+                            row_cells[i].text = cell_data
+                            # 设置单元格字体
+                            for paragraph in row_cells[i].paragraphs:
+                                for run in paragraph.runs:
+                                    run.font.name = '仿宋_GB2312'
+                                    run.font.size = Pt(16)
+            
+        except Exception as e:
+            logger.error(f"创建表格时发生错误: {str(e)}")
+    
+    def _add_page_numbers(self):
+        """
+        为整个文档添加连续页码
+        """
+        try:
+            # 获取文档的第一个节
+            section = self.document.sections[0]
+            
+            # 获取页脚
+            footer = section.footer
+            
+            # 清空现有页脚内容
+            footer._element.clear()
+            
+            # 创建页脚段落
+            footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+            footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 添加页码字段
+            run = footer_para.add_run()
+            
+            # 创建页码字段的XML
+            fldChar1 = OxmlElement('w:fldChar')
+            fldChar1.set(qn('w:fldCharType'), 'begin')
+            
+            instrText = OxmlElement('w:instrText')
+            instrText.text = 'PAGE'
+            
+            fldChar2 = OxmlElement('w:fldChar')
+            fldChar2.set(qn('w:fldCharType'), 'end')
+            
+            # 添加到run中
+            run._element.append(fldChar1)
+            run._element.append(instrText)
+            run._element.append(fldChar2)
+            
+            # 设置页码字体
+            run.font.name = '仿宋_GB2312'
+            run.font.size = Pt(14)
+            
+            logger.info("页码添加完成")
+            
+        except Exception as e:
+            logger.error(f"添加页码时发生错误: {str(e)}")
+
+# 全局文档生成器实例
+document_generator = OfficialDocumentGenerator() 
